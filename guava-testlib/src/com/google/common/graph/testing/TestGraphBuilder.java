@@ -16,45 +16,45 @@
 
 package com.google.common.graph.testing;
 
-import com.google.common.graph.Graph;
 import com.google.common.graph.GraphBuilder;
 import com.google.common.graph.ImmutableGraph;
+import com.google.common.graph.MutableGraph;
 
 /**
  * This class is useful for fluently building an immutable graph in tests. Example usage:
  * <pre><code>
  * // Constructs the following graph: (A)    (B)--->(C)
- * private static final ImmutableGraph<String, String> GRAPH =
- *     TestGraphBuilder.<String, String>init(GraphBuilder.directed())
+ * private static final ImmutableGraph<String> GRAPH =
+ *     TestGraphBuilder.<String>init(GraphBuilder.directed())
  *         .addNode("A")
  *         .addNode("B")
  *         .addNode("C")
- *         .addEdge("B->C", "B", "C")
+ *         .addEdge("B", "C")
  *         .toImmutableGraph();
  * </code></pre>
  */
-public final class TestGraphBuilder<N, E> {
-  private final Graph<N, E> graph;
+public final class TestGraphBuilder<N> {
+  private final MutableGraph<N> graph;
 
-  private TestGraphBuilder(Graph<N, E> graph) {
+  private TestGraphBuilder(MutableGraph<N> graph) {
     this.graph = graph;
   }
 
-  public static <N, E> TestGraphBuilder<N, E> init(GraphBuilder<? super N, ? super E> builder) {
-    return new TestGraphBuilder<N, E>(builder.<N, E>build());
+  public static <N> TestGraphBuilder<N> init(GraphBuilder<? super N> builder) {
+    return new TestGraphBuilder<N>(builder.<N>build());
   }
 
-  public TestGraphBuilder<N, E> addNode(N node) {
+  public TestGraphBuilder<N> addNode(N node) {
     graph.addNode(node);
     return this;
   }
 
-  public TestGraphBuilder<N, E> addEdge(E edge, N node1, N node2) {
-    graph.addEdge(edge, node1, node2);
+  public TestGraphBuilder<N> addEdge(N node1, N node2) {
+    graph.addEdge(node1, node2);
     return this;
   }
 
-  public ImmutableGraph<N, E> toImmutableGraph() {
+  public ImmutableGraph<N> toImmutableGraph() {
     return ImmutableGraph.copyOf(graph);
   }
 }

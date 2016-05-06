@@ -25,8 +25,6 @@ import static org.easymock.EasyMock.expect;
 import static org.easymock.EasyMock.isA;
 
 import com.google.common.base.Equivalence;
-import com.google.common.collect.MapMaker.RemovalListener;
-import com.google.common.collect.MapMaker.RemovalNotification;
 import com.google.common.collect.testing.features.CollectionFeature;
 import com.google.common.collect.testing.features.CollectionSize;
 import com.google.common.collect.testing.google.MultisetTestSuiteBuilder;
@@ -43,7 +41,6 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.ConcurrentSkipListMap;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
@@ -279,6 +276,7 @@ public class ConcurrentHashMultisetTest extends TestCase {
 
     try {
       cms.removeExactly("a", -2);
+      fail();
     } catch (IllegalArgumentException expected) {}
 
     assertTrue(cms.removeExactly("a", 0));
@@ -450,7 +448,7 @@ public class ConcurrentHashMultisetTest extends TestCase {
   }
 
   public void testSerializationWithMapMaker3() {
-    MapMaker mapMaker = new MapMaker().expireAfterWrite(1, TimeUnit.SECONDS);
+    MapMaker mapMaker = new MapMaker();
     multiset = ConcurrentHashMultiset.create(mapMaker);
     multiset.addAll(ImmutableList.of("a", "a", "b", "c", "d", "b"));
     reserializeAndAssert(multiset);
@@ -474,97 +472,6 @@ public class ConcurrentHashMultisetTest extends TestCase {
     assertFalse(multiset.contains(s2));
     assertEquals(1, multiset.count(s1));
     assertEquals(0, multiset.count(s2));
-  }
-
-//  @Suppress(owner = "bmanes", detail = "Does not call the eviction listener")
-//  public void testWithMapMakerEvictionListener_BROKEN1()
-//      throws InterruptedException {
-//    MapEvictionListener<String, Number> evictionListener =
-//        mockEvictionListener();
-//    evictionListener.onEviction("a", 5);
-//    EasyMock.replay(evictionListener);
-//
-//    GenericMapMaker<String, Number> mapMaker = new MapMaker()
-//        .expireAfterWrite(100, TimeUnit.MILLISECONDS)
-//        .evictionListener(evictionListener);
-//
-//    ConcurrentHashMultiset<String> multiset =
-//        ConcurrentHashMultiset.create(mapMaker);
-//
-//    multiset.add("a", 5);
-//
-//    assertTrue(multiset.contains("a"));
-//    assertEquals(5, multiset.count("a"));
-//
-//    Thread.sleep(2000);
-//
-//    EasyMock.verify(evictionListener);
-//  }
-
-//  @Suppress(owner = "bmanes", detail = "Does not call the eviction listener")
-//  public void testWithMapMakerEvictionListener_BROKEN2()
-//      throws InterruptedException {
-//    MapEvictionListener<String, Number> evictionListener =
-//        mockEvictionListener();
-//    evictionListener.onEviction("a", 5);
-//    EasyMock.replay(evictionListener);
-//
-//    GenericMapMaker<String, Number> mapMaker = new MapMaker()
-//        .expireAfterWrite(100, TimeUnit.MILLISECONDS)
-//        .evictionListener(evictionListener);
-//
-//    ConcurrentHashMultiset<String> multiset =
-//        ConcurrentHashMultiset.create(mapMaker);
-//
-//    multiset.add("a", 5);
-//
-//    assertTrue(multiset.contains("a"));
-//    assertEquals(5, multiset.count("a"));
-//
-//    Thread.sleep(2000);
-//
-//    // This call should have the side-effect of calling the
-//    // eviction listener, but it does not.
-//    assertFalse(multiset.contains("a"));
-//
-//    EasyMock.verify(evictionListener);
-//  }
-
-  public void testWithMapMakerEvictionListener() {
-    final List<RemovalNotification<String, Number>> notificationQueue = Lists.newArrayList();
-    RemovalListener<String, Number> removalListener =
-        new RemovalListener<String, Number>() {
-          @Override public void onRemoval(RemovalNotification<String, Number> notification) {
-            notificationQueue.add(notification);
-          }
-        };
-
-    @SuppressWarnings("deprecation") // TODO(kevinb): what to do?
-    MapMaker mapMaker = new MapMaker()
-        .concurrencyLevel(1)
-        .maximumSize(1);
-    /*
-     * Cleverly ignore the return type now that ConcurrentHashMultiset accepts only MapMaker and not
-     * the deprecated GenericMapMaker. We know that a RemovalListener<String, Number> is a type that
-     * will work with ConcurrentHashMultiset.
-     */
-    mapMaker.removalListener(removalListener);
-
-    ConcurrentHashMultiset<String> multiset = ConcurrentHashMultiset.create(mapMaker);
-
-    multiset.add("a", 5);
-    assertTrue(multiset.contains("a"));
-    assertEquals(5, multiset.count("a"));
-
-    multiset.add("b", 3);
-
-    assertFalse(multiset.contains("a"));
-    assertTrue(multiset.contains("b"));
-    assertEquals(3, multiset.count("b"));
-    RemovalNotification<String, Number> notification = Iterables.getOnlyElement(notificationQueue);
-    assertEquals("a", notification.getKey());
-    // The map evicted this entry, so CHM didn't have a chance to zero it.
-    assertEquals(5, notification.getValue().intValue());
   }
 
   private void replay() {

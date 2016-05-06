@@ -20,8 +20,6 @@ import static com.google.common.base.Preconditions.checkState;
 import com.google.common.annotations.GwtIncompatible;
 import com.google.common.base.Equivalence;
 import com.google.common.base.Function;
-import com.google.common.collect.MapMaker.RemovalCause;
-import com.google.common.collect.MapMaker.RemovalListener;
 import com.google.errorprone.annotations.CanIgnoreReturnValue;
 
 import java.io.IOException;
@@ -86,7 +84,6 @@ class ComputingConcurrentHashMap<K, V> extends MapMakerInternalMap<K, V> {
           if (e != null) {
             V value = getLiveValue(e);
             if (value != null) {
-              recordRead(e);
               return value;
             }
           }
@@ -115,20 +112,10 @@ class ComputingConcurrentHashMap<K, V> extends MapMakerInternalMap<K, V> {
                     createNewEntry = false;
                   } else {
                     V value = e.getValueReference().get();
-                    if (value == null) {
-                      enqueueNotification(entryKey, hash, value, RemovalCause.COLLECTED);
-                    } else if (map.expires() && map.isExpired(e)) {
-                      // This is a duplicate check, as preWriteCleanup already purged expired
-                      // entries, but let's accomodate an incorrect expiration queue.
-                      enqueueNotification(entryKey, hash, value, RemovalCause.EXPIRED);
-                    } else {
-                      recordLockedRead(e);
+                    if (value != null) {
                       return value;
                     }
 
-                    // immediately reuse invalid entries
-                    evictionQueue.remove(e);
-                    expirationQueue.remove(e);
                     this.count = newCount; // write-volatile
                   }
                   break;
@@ -148,7 +135,6 @@ class ComputingConcurrentHashMap<K, V> extends MapMakerInternalMap<K, V> {
               }
             } finally {
               unlock();
-              postWriteCleanup();
             }
 
             if (createNewEntry) {
@@ -162,7 +148,6 @@ class ComputingConcurrentHashMap<K, V> extends MapMakerInternalMap<K, V> {
           // don't consider expiration as we're concurrent with computation
           V value = e.getValueReference().waitForValue();
           if (value != null) {
-            recordRead(e);
             return value;
           }
           // else computing thread will clearValue
@@ -189,11 +174,7 @@ class ComputingConcurrentHashMap<K, V> extends MapMakerInternalMap<K, V> {
         }
         if (value != null) {
           // putIfAbsent
-          V oldValue = put(key, hash, value, true);
-          if (oldValue != null) {
-            // the computed value was already clobbered
-            enqueueNotification(key, hash, value, RemovalCause.REPLACED);
-          }
+          V unused = put(key, hash, value, true);
         }
         return value;
       } finally {
@@ -386,11 +367,7 @@ class ComputingConcurrentHashMap<K, V> extends MapMakerInternalMap<K, V> {
         valueStrength,
         keyEquivalence,
         valueEquivalence,
-        expireAfterWriteNanos,
-        expireAfterAccessNanos,
-        maximumSize,
         concurrencyLevel,
-        removalListener,
         this,
         computingFunction);
   }
@@ -404,11 +381,7 @@ class ComputingConcurrentHashMap<K, V> extends MapMakerInternalMap<K, V> {
         Strength valueStrength,
         Equivalence<Object> keyEquivalence,
         Equivalence<Object> valueEquivalence,
-        long expireAfterWriteNanos,
-        long expireAfterAccessNanos,
-        int maximumSize,
         int concurrencyLevel,
-        RemovalListener<? super K, ? super V> removalListener,
         ConcurrentMap<K, V> delegate,
         Function<? super K, ? extends V> computingFunction) {
       super(
@@ -416,11 +389,7 @@ class ComputingConcurrentHashMap<K, V> extends MapMakerInternalMap<K, V> {
           valueStrength,
           keyEquivalence,
           valueEquivalence,
-          expireAfterWriteNanos,
-          expireAfterAccessNanos,
-          maximumSize,
           concurrencyLevel,
-          removalListener,
           delegate);
       this.computingFunction = computingFunction;
     }

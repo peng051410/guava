@@ -24,23 +24,22 @@ import org.junit.runner.RunWith;
 import org.junit.runners.JUnit4;
 
 /**
- * Tests for a directed {@link ConfigurableGraph} allowing parallel edges.
+ * Tests for an undirected {@link ConfigurableMutableNetwork} allowing parallel edges.
  */
 @RunWith(JUnit4.class)
-public class ConfigurableDirectedMultigraphTest extends ConfigurableDirectedGraphTest {
+public class ConfigurableUndirectedMultiNetworkTest extends ConfigurableUndirectedNetworkTest {
   @Override
-  public Graph<Integer, String> createGraph() {
-    return GraphBuilder.directed().allowsParallelEdges(true).build();
+  public MutableNetwork<Integer, String> createGraph() {
+    return NetworkBuilder.undirected().allowsParallelEdges(true).build();
   }
 
   @Test
   public void edgesConnecting_parallelEdges() {
     assertTrue(addEdge(E12, N1, N2));
     assertTrue(addEdge(E12_A, N1, N2));
-    assertThat(graph.edgesConnecting(N1, N2)).containsExactly(E12, E12_A);
-    // Passed nodes should be in the correct edge direction, first is the
-    // source node and the second is the target node
-    assertThat(graph.edgesConnecting(N2, N1)).isEmpty();
+    assertTrue(addEdge(E21, N2, N1));
+    assertThat(graph.edgesConnecting(N1, N2)).containsExactly(E12, E12_A, E21);
+    assertThat(graph.edgesConnecting(N2, N1)).containsExactly(E12, E12_A, E21);
   }
 
   @Test
@@ -55,7 +54,8 @@ public class ConfigurableDirectedMultigraphTest extends ConfigurableDirectedGrap
   public void addEdge_parallelEdge() {
     assertTrue(addEdge(E12, N1, N2));
     assertTrue(addEdge(E12_A, N1, N2));
-    assertThat(graph.edgesConnecting(N1, N2)).containsExactly(E12, E12_A);
+    assertTrue(addEdge(E21, N2, N1));
+    assertThat(graph.edgesConnecting(N1, N2)).containsExactly(E12, E12_A, E21);
   }
 
   @Override
@@ -70,8 +70,9 @@ public class ConfigurableDirectedMultigraphTest extends ConfigurableDirectedGrap
   public void removeEdge_parallelEdge() {
     addEdge(E12, N1, N2);
     addEdge(E12_A, N1, N2);
+    addEdge(E21, N2, N1);
     assertTrue(graph.removeEdge(E12_A));
-    assertThat(graph.edgesConnecting(N1, N2)).containsExactly(E12);
+    assertThat(graph.edgesConnecting(N1, N2)).containsExactly(E12, E21);
   }
 
   @Test

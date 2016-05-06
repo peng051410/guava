@@ -20,11 +20,6 @@ import static com.google.common.collect.CollectPreconditions.checkRemove;
 import com.google.common.annotations.GwtIncompatible;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Equivalence;
-import com.google.common.base.Ticker;
-import com.google.common.collect.GenericMapMaker.NullListener;
-import com.google.common.collect.MapMaker.RemovalCause;
-import com.google.common.collect.MapMaker.RemovalListener;
-import com.google.common.collect.MapMaker.RemovalNotification;
 import com.google.common.primitives.Ints;
 import com.google.errorprone.annotations.CanIgnoreReturnValue;
 import com.google.j2objc.annotations.Weak;
@@ -36,29 +31,22 @@ import java.io.ObjectOutputStream;
 import java.io.Serializable;
 import java.lang.ref.Reference;
 import java.lang.ref.ReferenceQueue;
-import java.lang.ref.SoftReference;
 import java.lang.ref.WeakReference;
 import java.util.AbstractCollection;
 import java.util.AbstractMap;
-import java.util.AbstractQueue;
 import java.util.AbstractSet;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Iterator;
 import java.util.Map;
 import java.util.NoSuchElementException;
-import java.util.Queue;
 import java.util.Set;
 import java.util.concurrent.CancellationException;
-import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.ExecutionException;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReferenceArray;
 import java.util.concurrent.locks.ReentrantLock;
-import java.util.logging.Level;
-import java.util.logging.Logger;
 
 import javax.annotation.Nullable;
 import javax.annotation.concurrent.GuardedBy;
@@ -82,10 +70,6 @@ class MapMakerInternalMap<K, V> extends AbstractMap<K, V>
    * The basic strategy is to subdivide the table among Segments, each of which itself is a
    * concurrently readable hash table. The map supports non-blocking reads and concurrent writes
    * across different segments.
-   *
-   * If a maximum size is specified, a best-effort bounding is performed per segment, using a
-   * page-replacement algorithm to determine which entries to evict when the capacity has been
-   * exceeded.
    *
    * The page replacement algorithm's data structures are kept casually consistent with the map. The
    * ordering of writes to a segment is sequentially consistent. An update to the map and recording
@@ -139,8 +123,6 @@ class MapMakerInternalMap<K, V> extends AbstractMap<K, V>
 
   // Fields
 
-  private static final Logger logger = Logger.getLogger(MapMakerInternalMap.class.getName());
-
   /**
    * Mask value for indexing into segments. The upper bits of a key's hash code are used to choose
    * the segment.
@@ -171,30 +153,8 @@ class MapMakerInternalMap<K, V> extends AbstractMap<K, V>
   /** Strategy for referencing values. */
   final Strength valueStrength;
 
-  /** The maximum size of this map. MapMaker.UNSET_INT if there is no maximum. */
-  final int maximumSize;
-
-  /** How long after the last access to an entry the map will retain that entry. */
-  final long expireAfterAccessNanos;
-
-  /** How long after the last write to an entry the map will retain that entry. */
-  final long expireAfterWriteNanos;
-
-  /** Entries waiting to be consumed by the removal listener. */
-  // TODO(fry): define a new type which creates event objects and automates the clear logic
-  final Queue<RemovalNotification<K, V>> removalNotificationQueue;
-
-  /**
-   * A listener that is invoked when an entry is removed due to expiration or garbage collection of
-   * soft/weak entries.
-   */
-  final RemovalListener<K, V> removalListener;
-
   /** Factory used to create new entries. */
   final transient EntryFactory entryFactory;
-
-  /** Measures time in a testable way. */
-  final Ticker ticker;
 
   /**
    * Creates a new, empty map with the specified strategy, initial capacity and concurrency level.
@@ -208,31 +168,15 @@ class MapMakerInternalMap<K, V> extends AbstractMap<K, V>
     keyEquivalence = builder.getKeyEquivalence();
     valueEquivalence = valueStrength.defaultEquivalence();
 
-    maximumSize = builder.maximumSize;
-    expireAfterAccessNanos = builder.getExpireAfterAccessNanos();
-    expireAfterWriteNanos = builder.getExpireAfterWriteNanos();
-
-    entryFactory = EntryFactory.getFactory(keyStrength, expires(), evictsBySize());
-    ticker = builder.getTicker();
-
-    removalListener = builder.getRemovalListener();
-    removalNotificationQueue =
-        (removalListener == NullListener.INSTANCE)
-            ? MapMakerInternalMap.<RemovalNotification<K, V>>discardingQueue()
-            : new ConcurrentLinkedQueue<RemovalNotification<K, V>>();
+    entryFactory = EntryFactory.getFactory(keyStrength);
 
     int initialCapacity = Math.min(builder.getInitialCapacity(), MAXIMUM_CAPACITY);
-    if (evictsBySize()) {
-      initialCapacity = Math.min(initialCapacity, maximumSize);
-    }
 
     // Find power-of-two sizes best matching arguments. Constraints:
-    // (segmentCount <= maximumSize)
-    // && (concurrencyLevel > maximumSize || segmentCount > concurrencyLevel)
+    // (segmentCount > concurrencyLevel)
     int segmentShift = 0;
     int segmentCount = 1;
-    while (segmentCount < concurrencyLevel
-        && (!evictsBySize() || segmentCount * 2 <= maximumSize)) {
+    while (segmentCount < concurrencyLevel) {
       ++segmentShift;
       segmentCount <<= 1;
     }
@@ -251,37 +195,9 @@ class MapMakerInternalMap<K, V> extends AbstractMap<K, V>
       segmentSize <<= 1;
     }
 
-    if (evictsBySize()) {
-      // Ensure sum of segment max sizes = overall max size
-      int maximumSegmentSize = maximumSize / segmentCount + 1;
-      int remainder = maximumSize % segmentCount;
-      for (int i = 0; i < this.segments.length; ++i) {
-        if (i == remainder) {
-          maximumSegmentSize--;
-        }
-        this.segments[i] = createSegment(segmentSize, maximumSegmentSize);
-      }
-    } else {
-      for (int i = 0; i < this.segments.length; ++i) {
-        this.segments[i] = createSegment(segmentSize, MapMaker.UNSET_INT);
-      }
+    for (int i = 0; i < this.segments.length; ++i) {
+      this.segments[i] = createSegment(segmentSize, MapMaker.UNSET_INT);
     }
-  }
-
-  boolean evictsBySize() {
-    return maximumSize != MapMaker.UNSET_INT;
-  }
-
-  boolean expires() {
-    return expiresAfterWrite() || expiresAfterAccess();
-  }
-
-  boolean expiresAfterWrite() {
-    return expireAfterWriteNanos > 0;
-  }
-
-  boolean expiresAfterAccess() {
-    return expireAfterAccessNanos > 0;
   }
 
   boolean usesKeyReferences() {
@@ -308,19 +224,6 @@ class MapMakerInternalMap<K, V> extends AbstractMap<K, V>
       @Override
       Equivalence<Object> defaultEquivalence() {
         return Equivalence.equals();
-      }
-    },
-
-    SOFT {
-      @Override
-      <K, V> ValueReference<K, V> referenceValue(
-          Segment<K, V> segment, ReferenceEntry<K, V> entry, V value) {
-        return new SoftValueReference<K, V>(segment.valueReferenceQueue, value, entry);
-      }
-
-      @Override
-      Equivalence<Object> defaultEquivalence() {
-        return Equivalence.identity();
       }
     },
 
@@ -362,52 +265,6 @@ class MapMakerInternalMap<K, V> extends AbstractMap<K, V>
         return new StrongEntry<K, V>(key, hash, next);
       }
     },
-    STRONG_EXPIRABLE {
-      @Override
-      <K, V> ReferenceEntry<K, V> newEntry(
-          Segment<K, V> segment, K key, int hash, @Nullable ReferenceEntry<K, V> next) {
-        return new StrongExpirableEntry<K, V>(key, hash, next);
-      }
-
-      @Override
-      <K, V> ReferenceEntry<K, V> copyEntry(
-          Segment<K, V> segment, ReferenceEntry<K, V> original, ReferenceEntry<K, V> newNext) {
-        ReferenceEntry<K, V> newEntry = super.copyEntry(segment, original, newNext);
-        copyExpirableEntry(original, newEntry);
-        return newEntry;
-      }
-    },
-    STRONG_EVICTABLE {
-      @Override
-      <K, V> ReferenceEntry<K, V> newEntry(
-          Segment<K, V> segment, K key, int hash, @Nullable ReferenceEntry<K, V> next) {
-        return new StrongEvictableEntry<K, V>(key, hash, next);
-      }
-
-      @Override
-      <K, V> ReferenceEntry<K, V> copyEntry(
-          Segment<K, V> segment, ReferenceEntry<K, V> original, ReferenceEntry<K, V> newNext) {
-        ReferenceEntry<K, V> newEntry = super.copyEntry(segment, original, newNext);
-        copyEvictableEntry(original, newEntry);
-        return newEntry;
-      }
-    },
-    STRONG_EXPIRABLE_EVICTABLE {
-      @Override
-      <K, V> ReferenceEntry<K, V> newEntry(
-          Segment<K, V> segment, K key, int hash, @Nullable ReferenceEntry<K, V> next) {
-        return new StrongExpirableEvictableEntry<K, V>(key, hash, next);
-      }
-
-      @Override
-      <K, V> ReferenceEntry<K, V> copyEntry(
-          Segment<K, V> segment, ReferenceEntry<K, V> original, ReferenceEntry<K, V> newNext) {
-        ReferenceEntry<K, V> newEntry = super.copyEntry(segment, original, newNext);
-        copyExpirableEntry(original, newEntry);
-        copyEvictableEntry(original, newEntry);
-        return newEntry;
-      }
-    },
 
     WEAK {
       @Override
@@ -415,75 +272,16 @@ class MapMakerInternalMap<K, V> extends AbstractMap<K, V>
           Segment<K, V> segment, K key, int hash, @Nullable ReferenceEntry<K, V> next) {
         return new WeakEntry<K, V>(segment.keyReferenceQueue, key, hash, next);
       }
-    },
-    WEAK_EXPIRABLE {
-      @Override
-      <K, V> ReferenceEntry<K, V> newEntry(
-          Segment<K, V> segment, K key, int hash, @Nullable ReferenceEntry<K, V> next) {
-        return new WeakExpirableEntry<K, V>(segment.keyReferenceQueue, key, hash, next);
-      }
-
-      @Override
-      <K, V> ReferenceEntry<K, V> copyEntry(
-          Segment<K, V> segment, ReferenceEntry<K, V> original, ReferenceEntry<K, V> newNext) {
-        ReferenceEntry<K, V> newEntry = super.copyEntry(segment, original, newNext);
-        copyExpirableEntry(original, newEntry);
-        return newEntry;
-      }
-    },
-    WEAK_EVICTABLE {
-      @Override
-      <K, V> ReferenceEntry<K, V> newEntry(
-          Segment<K, V> segment, K key, int hash, @Nullable ReferenceEntry<K, V> next) {
-        return new WeakEvictableEntry<K, V>(segment.keyReferenceQueue, key, hash, next);
-      }
-
-      @Override
-      <K, V> ReferenceEntry<K, V> copyEntry(
-          Segment<K, V> segment, ReferenceEntry<K, V> original, ReferenceEntry<K, V> newNext) {
-        ReferenceEntry<K, V> newEntry = super.copyEntry(segment, original, newNext);
-        copyEvictableEntry(original, newEntry);
-        return newEntry;
-      }
-    },
-    WEAK_EXPIRABLE_EVICTABLE {
-      @Override
-      <K, V> ReferenceEntry<K, V> newEntry(
-          Segment<K, V> segment, K key, int hash, @Nullable ReferenceEntry<K, V> next) {
-        return new WeakExpirableEvictableEntry<K, V>(segment.keyReferenceQueue, key, hash, next);
-      }
-
-      @Override
-      <K, V> ReferenceEntry<K, V> copyEntry(
-          Segment<K, V> segment, ReferenceEntry<K, V> original, ReferenceEntry<K, V> newNext) {
-        ReferenceEntry<K, V> newEntry = super.copyEntry(segment, original, newNext);
-        copyExpirableEntry(original, newEntry);
-        copyEvictableEntry(original, newEntry);
-        return newEntry;
-      }
     };
 
-    /**
-     * Masks used to compute indices in the following table.
-     */
-    static final int EXPIRABLE_MASK = 1;
-
-    static final int EVICTABLE_MASK = 2;
-
-    /**
-     * Look-up table for factories. First dimension is the reference type. The second dimension is
-     * the result of OR-ing the feature masks.
-     */
-    static final EntryFactory[][] factories = {
-      {STRONG, STRONG_EXPIRABLE, STRONG_EVICTABLE, STRONG_EXPIRABLE_EVICTABLE},
-      {}, // no support for SOFT keys
-      {WEAK, WEAK_EXPIRABLE, WEAK_EVICTABLE, WEAK_EXPIRABLE_EVICTABLE}
-    };
-
-    static EntryFactory getFactory(
-        Strength keyStrength, boolean expireAfterWrite, boolean evictsBySize) {
-      int flags = (expireAfterWrite ? EXPIRABLE_MASK : 0) | (evictsBySize ? EVICTABLE_MASK : 0);
-      return factories[keyStrength.ordinal()][flags];
+    static EntryFactory getFactory(Strength keyStrength) {
+      switch (keyStrength) {
+        case STRONG:
+          return EntryFactory.STRONG;
+        case WEAK:
+          return EntryFactory.WEAK;
+      }
+      throw new AssertionError();
     }
 
     /**
@@ -507,28 +305,6 @@ class MapMakerInternalMap<K, V> extends AbstractMap<K, V>
     <K, V> ReferenceEntry<K, V> copyEntry(
         Segment<K, V> segment, ReferenceEntry<K, V> original, ReferenceEntry<K, V> newNext) {
       return newEntry(segment, original.getKey(), original.getHash(), newNext);
-    }
-
-    // Guarded By Segment.this
-    <K, V> void copyExpirableEntry(ReferenceEntry<K, V> original, ReferenceEntry<K, V> newEntry) {
-      // TODO(fry): when we link values instead of entries this method can go
-      // away, as can connectExpirables, nullifyExpirable.
-      newEntry.setExpirationTime(original.getExpirationTime());
-
-      connectExpirables(original.getPreviousExpirable(), newEntry);
-      connectExpirables(newEntry, original.getNextExpirable());
-
-      nullifyExpirable(original);
-    }
-
-    // Guarded By Segment.this
-    <K, V> void copyEvictableEntry(ReferenceEntry<K, V> original, ReferenceEntry<K, V> newEntry) {
-      // TODO(fry): when we link values instead of entries this method can go
-      // away, as can connectEvictables, nullifyEvictable.
-      connectEvictables(original.getPreviousEvictable(), newEntry);
-      connectEvictables(newEntry, original.getNextEvictable());
-
-      nullifyEvictable(original);
     }
   }
 
@@ -634,7 +410,6 @@ class MapMakerInternalMap<K, V> extends AbstractMap<K, V>
    * - Computing: computation is pending
    *
    * Invalid:
-   * - Expired: time expired (key/value may still be set)
    * - Collected: key/value was partially collected, but not yet cleaned up
    */
   interface ReferenceEntry<K, V> {
@@ -662,261 +437,10 @@ class MapMakerInternalMap<K, V> extends AbstractMap<K, V>
      * Gets the key for this entry.
      */
     K getKey();
-
-    /*
-     * Used by entries that are expirable. Expirable entries are maintained in a doubly-linked list.
-     * New entries are added at the tail of the list at write time; stale entries are expired from
-     * the head of the list.
-     */
-
-    /**
-     * Gets the entry expiration time in ns.
-     */
-    long getExpirationTime();
-
-    /**
-     * Sets the entry expiration time in ns.
-     */
-    void setExpirationTime(long time);
-
-    /**
-     * Gets the next entry in the recency list.
-     */
-    ReferenceEntry<K, V> getNextExpirable();
-
-    /**
-     * Sets the next entry in the recency list.
-     */
-    void setNextExpirable(ReferenceEntry<K, V> next);
-
-    /**
-     * Gets the previous entry in the recency list.
-     */
-    ReferenceEntry<K, V> getPreviousExpirable();
-
-    /**
-     * Sets the previous entry in the recency list.
-     */
-    void setPreviousExpirable(ReferenceEntry<K, V> previous);
-
-    /*
-     * Implemented by entries that are evictable. Evictable entries are maintained in a
-     * doubly-linked list. New entries are added at the tail of the list at write time and stale
-     * entries are expired from the head of the list.
-     */
-
-    /**
-     * Gets the next entry in the recency list.
-     */
-    ReferenceEntry<K, V> getNextEvictable();
-
-    /**
-     * Sets the next entry in the recency list.
-     */
-    void setNextEvictable(ReferenceEntry<K, V> next);
-
-    /**
-     * Gets the previous entry in the recency list.
-     */
-    ReferenceEntry<K, V> getPreviousEvictable();
-
-    /**
-     * Sets the previous entry in the recency list.
-     */
-    void setPreviousEvictable(ReferenceEntry<K, V> previous);
-  }
-
-  private enum NullEntry implements ReferenceEntry<Object, Object> {
-    INSTANCE;
-
-    @Override
-    public ValueReference<Object, Object> getValueReference() {
-      return null;
-    }
-
-    @Override
-    public void setValueReference(ValueReference<Object, Object> valueReference) {}
-
-    @Override
-    public ReferenceEntry<Object, Object> getNext() {
-      return null;
-    }
-
-    @Override
-    public int getHash() {
-      return 0;
-    }
-
-    @Override
-    public Object getKey() {
-      return null;
-    }
-
-    @Override
-    public long getExpirationTime() {
-      return 0;
-    }
-
-    @Override
-    public void setExpirationTime(long time) {}
-
-    @Override
-    public ReferenceEntry<Object, Object> getNextExpirable() {
-      return this;
-    }
-
-    @Override
-    public void setNextExpirable(ReferenceEntry<Object, Object> next) {}
-
-    @Override
-    public ReferenceEntry<Object, Object> getPreviousExpirable() {
-      return this;
-    }
-
-    @Override
-    public void setPreviousExpirable(ReferenceEntry<Object, Object> previous) {}
-
-    @Override
-    public ReferenceEntry<Object, Object> getNextEvictable() {
-      return this;
-    }
-
-    @Override
-    public void setNextEvictable(ReferenceEntry<Object, Object> next) {}
-
-    @Override
-    public ReferenceEntry<Object, Object> getPreviousEvictable() {
-      return this;
-    }
-
-    @Override
-    public void setPreviousEvictable(ReferenceEntry<Object, Object> previous) {}
-  }
-
-  abstract static class AbstractReferenceEntry<K, V> implements ReferenceEntry<K, V> {
-    @Override
-    public ValueReference<K, V> getValueReference() {
-      throw new UnsupportedOperationException();
-    }
-
-    @Override
-    public void setValueReference(ValueReference<K, V> valueReference) {
-      throw new UnsupportedOperationException();
-    }
-
-    @Override
-    public ReferenceEntry<K, V> getNext() {
-      throw new UnsupportedOperationException();
-    }
-
-    @Override
-    public int getHash() {
-      throw new UnsupportedOperationException();
-    }
-
-    @Override
-    public K getKey() {
-      throw new UnsupportedOperationException();
-    }
-
-    @Override
-    public long getExpirationTime() {
-      throw new UnsupportedOperationException();
-    }
-
-    @Override
-    public void setExpirationTime(long time) {
-      throw new UnsupportedOperationException();
-    }
-
-    @Override
-    public ReferenceEntry<K, V> getNextExpirable() {
-      throw new UnsupportedOperationException();
-    }
-
-    @Override
-    public void setNextExpirable(ReferenceEntry<K, V> next) {
-      throw new UnsupportedOperationException();
-    }
-
-    @Override
-    public ReferenceEntry<K, V> getPreviousExpirable() {
-      throw new UnsupportedOperationException();
-    }
-
-    @Override
-    public void setPreviousExpirable(ReferenceEntry<K, V> previous) {
-      throw new UnsupportedOperationException();
-    }
-
-    @Override
-    public ReferenceEntry<K, V> getNextEvictable() {
-      throw new UnsupportedOperationException();
-    }
-
-    @Override
-    public void setNextEvictable(ReferenceEntry<K, V> next) {
-      throw new UnsupportedOperationException();
-    }
-
-    @Override
-    public ReferenceEntry<K, V> getPreviousEvictable() {
-      throw new UnsupportedOperationException();
-    }
-
-    @Override
-    public void setPreviousEvictable(ReferenceEntry<K, V> previous) {
-      throw new UnsupportedOperationException();
-    }
-  }
-
-  @SuppressWarnings("unchecked") // impl never uses a parameter or returns any non-null value
-  static <K, V> ReferenceEntry<K, V> nullEntry() {
-    return (ReferenceEntry<K, V>) NullEntry.INSTANCE;
-  }
-
-  static final Queue<? extends Object> DISCARDING_QUEUE =
-      new AbstractQueue<Object>() {
-        @Override
-        public boolean offer(Object o) {
-          return true;
-        }
-
-        @Override
-        public Object peek() {
-          return null;
-        }
-
-        @Override
-        public Object poll() {
-          return null;
-        }
-
-        @Override
-        public int size() {
-          return 0;
-        }
-
-        @Override
-        public Iterator<Object> iterator() {
-          return Iterators.emptyIterator();
-        }
-      };
-
-  /**
-   * Queue that discards all elements.
-   */
-  @SuppressWarnings("unchecked") // impl never uses a parameter or returns any non-null value
-  static <E> Queue<E> discardingQueue() {
-    return (Queue) DISCARDING_QUEUE;
   }
 
   /*
    * Note: All of this duplicate code sucks, but it saves a lot of memory. If only Java had mixins!
-   * To maintain this code, make a change for the strong reference type. Then, cut and paste, and
-   * replace "Strong" with "Soft" or "Weak" within the pasted text. The primary difference is that
-   * strong entries store the key reference directly while soft and weak entries delegate to their
-   * respective superclasses.
    */
 
   /**
@@ -936,60 +460,6 @@ class MapMakerInternalMap<K, V> extends AbstractMap<K, V>
       return this.key;
     }
 
-    // null expiration
-
-    @Override
-    public long getExpirationTime() {
-      throw new UnsupportedOperationException();
-    }
-
-    @Override
-    public void setExpirationTime(long time) {
-      throw new UnsupportedOperationException();
-    }
-
-    @Override
-    public ReferenceEntry<K, V> getNextExpirable() {
-      throw new UnsupportedOperationException();
-    }
-
-    @Override
-    public void setNextExpirable(ReferenceEntry<K, V> next) {
-      throw new UnsupportedOperationException();
-    }
-
-    @Override
-    public ReferenceEntry<K, V> getPreviousExpirable() {
-      throw new UnsupportedOperationException();
-    }
-
-    @Override
-    public void setPreviousExpirable(ReferenceEntry<K, V> previous) {
-      throw new UnsupportedOperationException();
-    }
-
-    // null eviction
-
-    @Override
-    public ReferenceEntry<K, V> getNextEvictable() {
-      throw new UnsupportedOperationException();
-    }
-
-    @Override
-    public void setNextEvictable(ReferenceEntry<K, V> next) {
-      throw new UnsupportedOperationException();
-    }
-
-    @Override
-    public ReferenceEntry<K, V> getPreviousEvictable() {
-      throw new UnsupportedOperationException();
-    }
-
-    @Override
-    public void setPreviousEvictable(ReferenceEntry<K, V> previous) {
-      throw new UnsupportedOperationException();
-    }
-
     // The code below is exactly the same for each entry type.
 
     final int hash;
@@ -1016,420 +486,6 @@ class MapMakerInternalMap<K, V> extends AbstractMap<K, V>
     @Override
     public ReferenceEntry<K, V> getNext() {
       return next;
-    }
-  }
-
-  static final class StrongExpirableEntry<K, V> extends StrongEntry<K, V>
-      implements ReferenceEntry<K, V> {
-    StrongExpirableEntry(K key, int hash, @Nullable ReferenceEntry<K, V> next) {
-      super(key, hash, next);
-    }
-
-    // The code below is exactly the same for each expirable entry type.
-
-    volatile long time = Long.MAX_VALUE;
-
-    @Override
-    public long getExpirationTime() {
-      return time;
-    }
-
-    @Override
-    public void setExpirationTime(long time) {
-      this.time = time;
-    }
-
-    // Guarded By Segment.this
-    ReferenceEntry<K, V> nextExpirable = nullEntry();
-
-    @Override
-    public ReferenceEntry<K, V> getNextExpirable() {
-      return nextExpirable;
-    }
-
-    @Override
-    public void setNextExpirable(ReferenceEntry<K, V> next) {
-      this.nextExpirable = next;
-    }
-
-    // Guarded By Segment.this
-    ReferenceEntry<K, V> previousExpirable = nullEntry();
-
-    @Override
-    public ReferenceEntry<K, V> getPreviousExpirable() {
-      return previousExpirable;
-    }
-
-    @Override
-    public void setPreviousExpirable(ReferenceEntry<K, V> previous) {
-      this.previousExpirable = previous;
-    }
-  }
-
-  static final class StrongEvictableEntry<K, V> extends StrongEntry<K, V>
-      implements ReferenceEntry<K, V> {
-    StrongEvictableEntry(K key, int hash, @Nullable ReferenceEntry<K, V> next) {
-      super(key, hash, next);
-    }
-
-    // The code below is exactly the same for each evictable entry type.
-
-    // Guarded By Segment.this
-    ReferenceEntry<K, V> nextEvictable = nullEntry();
-
-    @Override
-    public ReferenceEntry<K, V> getNextEvictable() {
-      return nextEvictable;
-    }
-
-    @Override
-    public void setNextEvictable(ReferenceEntry<K, V> next) {
-      this.nextEvictable = next;
-    }
-
-    // Guarded By Segment.this
-    ReferenceEntry<K, V> previousEvictable = nullEntry();
-
-    @Override
-    public ReferenceEntry<K, V> getPreviousEvictable() {
-      return previousEvictable;
-    }
-
-    @Override
-    public void setPreviousEvictable(ReferenceEntry<K, V> previous) {
-      this.previousEvictable = previous;
-    }
-  }
-
-  static final class StrongExpirableEvictableEntry<K, V> extends StrongEntry<K, V>
-      implements ReferenceEntry<K, V> {
-    StrongExpirableEvictableEntry(K key, int hash, @Nullable ReferenceEntry<K, V> next) {
-      super(key, hash, next);
-    }
-
-    // The code below is exactly the same for each expirable entry type.
-
-    volatile long time = Long.MAX_VALUE;
-
-    @Override
-    public long getExpirationTime() {
-      return time;
-    }
-
-    @Override
-    public void setExpirationTime(long time) {
-      this.time = time;
-    }
-
-    // Guarded By Segment.this
-    ReferenceEntry<K, V> nextExpirable = nullEntry();
-
-    @Override
-    public ReferenceEntry<K, V> getNextExpirable() {
-      return nextExpirable;
-    }
-
-    @Override
-    public void setNextExpirable(ReferenceEntry<K, V> next) {
-      this.nextExpirable = next;
-    }
-
-    // Guarded By Segment.this
-    ReferenceEntry<K, V> previousExpirable = nullEntry();
-
-    @Override
-    public ReferenceEntry<K, V> getPreviousExpirable() {
-      return previousExpirable;
-    }
-
-    @Override
-    public void setPreviousExpirable(ReferenceEntry<K, V> previous) {
-      this.previousExpirable = previous;
-    }
-
-    // The code below is exactly the same for each evictable entry type.
-
-    // Guarded By Segment.this
-    ReferenceEntry<K, V> nextEvictable = nullEntry();
-
-    @Override
-    public ReferenceEntry<K, V> getNextEvictable() {
-      return nextEvictable;
-    }
-
-    @Override
-    public void setNextEvictable(ReferenceEntry<K, V> next) {
-      this.nextEvictable = next;
-    }
-
-    // Guarded By Segment.this
-    ReferenceEntry<K, V> previousEvictable = nullEntry();
-
-    @Override
-    public ReferenceEntry<K, V> getPreviousEvictable() {
-      return previousEvictable;
-    }
-
-    @Override
-    public void setPreviousEvictable(ReferenceEntry<K, V> previous) {
-      this.previousEvictable = previous;
-    }
-  }
-
-  /**
-   * Used for softly-referenced keys.
-   */
-  static class SoftEntry<K, V> extends SoftReference<K> implements ReferenceEntry<K, V> {
-    SoftEntry(ReferenceQueue<K> queue, K key, int hash, @Nullable ReferenceEntry<K, V> next) {
-      super(key, queue);
-      this.hash = hash;
-      this.next = next;
-    }
-
-    @Override
-    public K getKey() {
-      return get();
-    }
-
-    // null expiration
-    @Override
-    public long getExpirationTime() {
-      throw new UnsupportedOperationException();
-    }
-
-    @Override
-    public void setExpirationTime(long time) {
-      throw new UnsupportedOperationException();
-    }
-
-    @Override
-    public ReferenceEntry<K, V> getNextExpirable() {
-      throw new UnsupportedOperationException();
-    }
-
-    @Override
-    public void setNextExpirable(ReferenceEntry<K, V> next) {
-      throw new UnsupportedOperationException();
-    }
-
-    @Override
-    public ReferenceEntry<K, V> getPreviousExpirable() {
-      throw new UnsupportedOperationException();
-    }
-
-    @Override
-    public void setPreviousExpirable(ReferenceEntry<K, V> previous) {
-      throw new UnsupportedOperationException();
-    }
-
-    // null eviction
-
-    @Override
-    public ReferenceEntry<K, V> getNextEvictable() {
-      throw new UnsupportedOperationException();
-    }
-
-    @Override
-    public void setNextEvictable(ReferenceEntry<K, V> next) {
-      throw new UnsupportedOperationException();
-    }
-
-    @Override
-    public ReferenceEntry<K, V> getPreviousEvictable() {
-      throw new UnsupportedOperationException();
-    }
-
-    @Override
-    public void setPreviousEvictable(ReferenceEntry<K, V> previous) {
-      throw new UnsupportedOperationException();
-    }
-
-    // The code below is exactly the same for each entry type.
-
-    final int hash;
-    final ReferenceEntry<K, V> next;
-    volatile ValueReference<K, V> valueReference = unset();
-
-    @Override
-    public ValueReference<K, V> getValueReference() {
-      return valueReference;
-    }
-
-    @Override
-    public void setValueReference(ValueReference<K, V> valueReference) {
-      ValueReference<K, V> previous = this.valueReference;
-      this.valueReference = valueReference;
-      previous.clear(valueReference);
-    }
-
-    @Override
-    public int getHash() {
-      return hash;
-    }
-
-    @Override
-    public ReferenceEntry<K, V> getNext() {
-      return next;
-    }
-  }
-
-  static final class SoftExpirableEntry<K, V> extends SoftEntry<K, V>
-      implements ReferenceEntry<K, V> {
-    SoftExpirableEntry(
-        ReferenceQueue<K> queue, K key, int hash, @Nullable ReferenceEntry<K, V> next) {
-      super(queue, key, hash, next);
-    }
-
-    // The code below is exactly the same for each expirable entry type.
-
-    volatile long time = Long.MAX_VALUE;
-
-    @Override
-    public long getExpirationTime() {
-      return time;
-    }
-
-    @Override
-    public void setExpirationTime(long time) {
-      this.time = time;
-    }
-
-    // Guarded By Segment.this
-    ReferenceEntry<K, V> nextExpirable = nullEntry();
-
-    @Override
-    public ReferenceEntry<K, V> getNextExpirable() {
-      return nextExpirable;
-    }
-
-    @Override
-    public void setNextExpirable(ReferenceEntry<K, V> next) {
-      this.nextExpirable = next;
-    }
-
-    // Guarded By Segment.this
-    ReferenceEntry<K, V> previousExpirable = nullEntry();
-
-    @Override
-    public ReferenceEntry<K, V> getPreviousExpirable() {
-      return previousExpirable;
-    }
-
-    @Override
-    public void setPreviousExpirable(ReferenceEntry<K, V> previous) {
-      this.previousExpirable = previous;
-    }
-  }
-
-  static final class SoftEvictableEntry<K, V> extends SoftEntry<K, V>
-      implements ReferenceEntry<K, V> {
-    SoftEvictableEntry(
-        ReferenceQueue<K> queue, K key, int hash, @Nullable ReferenceEntry<K, V> next) {
-      super(queue, key, hash, next);
-    }
-
-    // The code below is exactly the same for each evictable entry type.
-
-    // Guarded By Segment.this
-    ReferenceEntry<K, V> nextEvictable = nullEntry();
-
-    @Override
-    public ReferenceEntry<K, V> getNextEvictable() {
-      return nextEvictable;
-    }
-
-    @Override
-    public void setNextEvictable(ReferenceEntry<K, V> next) {
-      this.nextEvictable = next;
-    }
-
-    // Guarded By Segment.this
-    ReferenceEntry<K, V> previousEvictable = nullEntry();
-
-    @Override
-    public ReferenceEntry<K, V> getPreviousEvictable() {
-      return previousEvictable;
-    }
-
-    @Override
-    public void setPreviousEvictable(ReferenceEntry<K, V> previous) {
-      this.previousEvictable = previous;
-    }
-  }
-
-  static final class SoftExpirableEvictableEntry<K, V> extends SoftEntry<K, V>
-      implements ReferenceEntry<K, V> {
-    SoftExpirableEvictableEntry(
-        ReferenceQueue<K> queue, K key, int hash, @Nullable ReferenceEntry<K, V> next) {
-      super(queue, key, hash, next);
-    }
-
-    // The code below is exactly the same for each expirable entry type.
-
-    volatile long time = Long.MAX_VALUE;
-
-    @Override
-    public long getExpirationTime() {
-      return time;
-    }
-
-    @Override
-    public void setExpirationTime(long time) {
-      this.time = time;
-    }
-
-    // Guarded By Segment.this
-    ReferenceEntry<K, V> nextExpirable = nullEntry();
-
-    @Override
-    public ReferenceEntry<K, V> getNextExpirable() {
-      return nextExpirable;
-    }
-
-    @Override
-    public void setNextExpirable(ReferenceEntry<K, V> next) {
-      this.nextExpirable = next;
-    }
-
-    // Guarded By Segment.this
-    ReferenceEntry<K, V> previousExpirable = nullEntry();
-
-    @Override
-    public ReferenceEntry<K, V> getPreviousExpirable() {
-      return previousExpirable;
-    }
-
-    @Override
-    public void setPreviousExpirable(ReferenceEntry<K, V> previous) {
-      this.previousExpirable = previous;
-    }
-
-    // The code below is exactly the same for each evictable entry type.
-
-    // Guarded By Segment.this
-    ReferenceEntry<K, V> nextEvictable = nullEntry();
-
-    @Override
-    public ReferenceEntry<K, V> getNextEvictable() {
-      return nextEvictable;
-    }
-
-    @Override
-    public void setNextEvictable(ReferenceEntry<K, V> next) {
-      this.nextEvictable = next;
-    }
-
-    // Guarded By Segment.this
-    ReferenceEntry<K, V> previousEvictable = nullEntry();
-
-    @Override
-    public ReferenceEntry<K, V> getPreviousEvictable() {
-      return previousEvictable;
-    }
-
-    @Override
-    public void setPreviousEvictable(ReferenceEntry<K, V> previous) {
-      this.previousEvictable = previous;
     }
   }
 
@@ -1448,60 +504,6 @@ class MapMakerInternalMap<K, V> extends AbstractMap<K, V>
       return get();
     }
 
-    // null expiration
-
-    @Override
-    public long getExpirationTime() {
-      throw new UnsupportedOperationException();
-    }
-
-    @Override
-    public void setExpirationTime(long time) {
-      throw new UnsupportedOperationException();
-    }
-
-    @Override
-    public ReferenceEntry<K, V> getNextExpirable() {
-      throw new UnsupportedOperationException();
-    }
-
-    @Override
-    public void setNextExpirable(ReferenceEntry<K, V> next) {
-      throw new UnsupportedOperationException();
-    }
-
-    @Override
-    public ReferenceEntry<K, V> getPreviousExpirable() {
-      throw new UnsupportedOperationException();
-    }
-
-    @Override
-    public void setPreviousExpirable(ReferenceEntry<K, V> previous) {
-      throw new UnsupportedOperationException();
-    }
-
-    // null eviction
-
-    @Override
-    public ReferenceEntry<K, V> getNextEvictable() {
-      throw new UnsupportedOperationException();
-    }
-
-    @Override
-    public void setNextEvictable(ReferenceEntry<K, V> next) {
-      throw new UnsupportedOperationException();
-    }
-
-    @Override
-    public ReferenceEntry<K, V> getPreviousEvictable() {
-      throw new UnsupportedOperationException();
-    }
-
-    @Override
-    public void setPreviousEvictable(ReferenceEntry<K, V> previous) {
-      throw new UnsupportedOperationException();
-    }
-
     // The code below is exactly the same for each entry type.
 
     final int hash;
@@ -1528,166 +530,6 @@ class MapMakerInternalMap<K, V> extends AbstractMap<K, V>
     @Override
     public ReferenceEntry<K, V> getNext() {
       return next;
-    }
-  }
-
-  static final class WeakExpirableEntry<K, V> extends WeakEntry<K, V>
-      implements ReferenceEntry<K, V> {
-    WeakExpirableEntry(
-        ReferenceQueue<K> queue, K key, int hash, @Nullable ReferenceEntry<K, V> next) {
-      super(queue, key, hash, next);
-    }
-
-    // The code below is exactly the same for each expirable entry type.
-
-    volatile long time = Long.MAX_VALUE;
-
-    @Override
-    public long getExpirationTime() {
-      return time;
-    }
-
-    @Override
-    public void setExpirationTime(long time) {
-      this.time = time;
-    }
-
-    // Guarded By Segment.this
-    ReferenceEntry<K, V> nextExpirable = nullEntry();
-
-    @Override
-    public ReferenceEntry<K, V> getNextExpirable() {
-      return nextExpirable;
-    }
-
-    @Override
-    public void setNextExpirable(ReferenceEntry<K, V> next) {
-      this.nextExpirable = next;
-    }
-
-    // Guarded By Segment.this
-    ReferenceEntry<K, V> previousExpirable = nullEntry();
-
-    @Override
-    public ReferenceEntry<K, V> getPreviousExpirable() {
-      return previousExpirable;
-    }
-
-    @Override
-    public void setPreviousExpirable(ReferenceEntry<K, V> previous) {
-      this.previousExpirable = previous;
-    }
-  }
-
-  static final class WeakEvictableEntry<K, V> extends WeakEntry<K, V>
-      implements ReferenceEntry<K, V> {
-    WeakEvictableEntry(
-        ReferenceQueue<K> queue, K key, int hash, @Nullable ReferenceEntry<K, V> next) {
-      super(queue, key, hash, next);
-    }
-
-    // The code below is exactly the same for each evictable entry type.
-
-    // Guarded By Segment.this
-    ReferenceEntry<K, V> nextEvictable = nullEntry();
-
-    @Override
-    public ReferenceEntry<K, V> getNextEvictable() {
-      return nextEvictable;
-    }
-
-    @Override
-    public void setNextEvictable(ReferenceEntry<K, V> next) {
-      this.nextEvictable = next;
-    }
-
-    // Guarded By Segment.this
-    ReferenceEntry<K, V> previousEvictable = nullEntry();
-
-    @Override
-    public ReferenceEntry<K, V> getPreviousEvictable() {
-      return previousEvictable;
-    }
-
-    @Override
-    public void setPreviousEvictable(ReferenceEntry<K, V> previous) {
-      this.previousEvictable = previous;
-    }
-  }
-
-  static final class WeakExpirableEvictableEntry<K, V> extends WeakEntry<K, V>
-      implements ReferenceEntry<K, V> {
-    WeakExpirableEvictableEntry(
-        ReferenceQueue<K> queue, K key, int hash, @Nullable ReferenceEntry<K, V> next) {
-      super(queue, key, hash, next);
-    }
-
-    // The code below is exactly the same for each expirable entry type.
-
-    volatile long time = Long.MAX_VALUE;
-
-    @Override
-    public long getExpirationTime() {
-      return time;
-    }
-
-    @Override
-    public void setExpirationTime(long time) {
-      this.time = time;
-    }
-
-    // Guarded By Segment.this
-    ReferenceEntry<K, V> nextExpirable = nullEntry();
-
-    @Override
-    public ReferenceEntry<K, V> getNextExpirable() {
-      return nextExpirable;
-    }
-
-    @Override
-    public void setNextExpirable(ReferenceEntry<K, V> next) {
-      this.nextExpirable = next;
-    }
-
-    // Guarded By Segment.this
-    ReferenceEntry<K, V> previousExpirable = nullEntry();
-
-    @Override
-    public ReferenceEntry<K, V> getPreviousExpirable() {
-      return previousExpirable;
-    }
-
-    @Override
-    public void setPreviousExpirable(ReferenceEntry<K, V> previous) {
-      this.previousExpirable = previous;
-    }
-
-    // The code below is exactly the same for each evictable entry type.
-
-    // Guarded By Segment.this
-    ReferenceEntry<K, V> nextEvictable = nullEntry();
-
-    @Override
-    public ReferenceEntry<K, V> getNextEvictable() {
-      return nextEvictable;
-    }
-
-    @Override
-    public void setNextEvictable(ReferenceEntry<K, V> next) {
-      this.nextEvictable = next;
-    }
-
-    // Guarded By Segment.this
-    ReferenceEntry<K, V> previousEvictable = nullEntry();
-
-    @Override
-    public ReferenceEntry<K, V> getPreviousEvictable() {
-      return previousEvictable;
-    }
-
-    @Override
-    public void setPreviousEvictable(ReferenceEntry<K, V> previous) {
-      this.previousEvictable = previous;
     }
   }
 
@@ -1717,45 +559,6 @@ class MapMakerInternalMap<K, V> extends AbstractMap<K, V>
     public ValueReference<K, V> copyFor(
         ReferenceQueue<V> queue, V value, ReferenceEntry<K, V> entry) {
       return new WeakValueReference<K, V>(queue, value, entry);
-    }
-
-    @Override
-    public boolean isComputingReference() {
-      return false;
-    }
-
-    @Override
-    public V waitForValue() {
-      return get();
-    }
-  }
-
-  /**
-   * References a soft value.
-   */
-  static final class SoftValueReference<K, V> extends SoftReference<V>
-      implements ValueReference<K, V> {
-    final ReferenceEntry<K, V> entry;
-
-    SoftValueReference(ReferenceQueue<V> queue, V referent, ReferenceEntry<K, V> entry) {
-      super(referent, queue);
-      this.entry = entry;
-    }
-
-    @Override
-    public ReferenceEntry<K, V> getEntry() {
-      return entry;
-    }
-
-    @Override
-    public void clear(ValueReference<K, V> newValue) {
-      clear();
-    }
-
-    @Override
-    public ValueReference<K, V> copyFor(
-        ReferenceQueue<V> queue, V value, ReferenceEntry<K, V> entry) {
-      return new SoftValueReference<K, V>(queue, value, entry);
     }
 
     @Override
@@ -1900,7 +703,7 @@ class MapMakerInternalMap<K, V> extends AbstractMap<K, V>
 
   /**
    * Gets the value from an entry. Returns {@code null} if the entry is invalid,
-   * partially-collected, computing, or expired. Unlike {@link Segment#getLiveValue} this method
+   * partially-collected or computing. Unlike {@link Segment#getLiveValue} this method
    * does not attempt to clean up stale entries.
    */
   V getLiveValue(ReferenceEntry<K, V> entry) {
@@ -1911,73 +714,7 @@ class MapMakerInternalMap<K, V> extends AbstractMap<K, V>
     if (value == null) {
       return null;
     }
-
-    if (expires() && isExpired(entry)) {
-      return null;
-    }
     return value;
-  }
-
-  // expiration
-
-  /**
-   * Returns {@code true} if the entry has expired.
-   */
-  boolean isExpired(ReferenceEntry<K, V> entry) {
-    return isExpired(entry, ticker.read());
-  }
-
-  /**
-   * Returns {@code true} if the entry has expired.
-   */
-  boolean isExpired(ReferenceEntry<K, V> entry, long now) {
-    // if the expiration time had overflowed, this "undoes" the overflow
-    return now - entry.getExpirationTime() > 0;
-  }
-
-  // Guarded By Segment.this
-  static <K, V> void connectExpirables(ReferenceEntry<K, V> previous, ReferenceEntry<K, V> next) {
-    previous.setNextExpirable(next);
-    next.setPreviousExpirable(previous);
-  }
-
-  // Guarded By Segment.this
-  static <K, V> void nullifyExpirable(ReferenceEntry<K, V> nulled) {
-    ReferenceEntry<K, V> nullEntry = nullEntry();
-    nulled.setNextExpirable(nullEntry);
-    nulled.setPreviousExpirable(nullEntry);
-  }
-
-  // eviction
-
-  /**
-   * Notifies listeners that an entry has been automatically removed due to expiration, eviction,
-   * or eligibility for garbage collection. This should be called every time expireEntries or
-   * evictEntry is called (once the lock is released).
-   */
-  void processPendingNotifications() {
-    RemovalNotification<K, V> notification;
-    while ((notification = removalNotificationQueue.poll()) != null) {
-      try {
-        removalListener.onRemoval(notification);
-      } catch (Exception e) {
-        logger.log(Level.WARNING, "Exception thrown by removal listener", e);
-      }
-    }
-  }
-
-  /** Links the evitables together. */
-  // Guarded By Segment.this
-  static <K, V> void connectEvictables(ReferenceEntry<K, V> previous, ReferenceEntry<K, V> next) {
-    previous.setNextEvictable(next);
-    next.setPreviousEvictable(previous);
-  }
-
-  // Guarded By Segment.this
-  static <K, V> void nullifyEvictable(ReferenceEntry<K, V> nulled) {
-    ReferenceEntry<K, V> nullEntry = nullEntry();
-    nulled.setNextEvictable(nullEntry);
-    nulled.setPreviousEvictable(nullEntry);
   }
 
   @SuppressWarnings("unchecked")
@@ -1993,11 +730,6 @@ class MapMakerInternalMap<K, V> extends AbstractMap<K, V>
    */
   @SuppressWarnings("serial") // This class is never serialized.
   static class Segment<K, V> extends ReentrantLock {
-
-    /*
-     * TODO(fry): Consider copying variables (like evictsBySize) from outer class into this class.
-     * It will require more memory but will reduce indirection.
-     */
 
     /*
      * Segments maintain a table of entry lists that are ALWAYS kept in a consistent state, so can
@@ -2072,31 +804,10 @@ class MapMakerInternalMap<K, V> extends AbstractMap<K, V>
     final ReferenceQueue<V> valueReferenceQueue;
 
     /**
-     * The recency queue is used to record which entries were accessed for updating the eviction
-     * list's ordering. It is drained as a batch operation when either the DRAIN_THRESHOLD is
-     * crossed or a write occurs on the segment.
-     */
-    final Queue<ReferenceEntry<K, V>> recencyQueue;
-
-    /**
      * A counter of the number of reads since the last write, used to drain queues on a small
      * fraction of read operations.
      */
     final AtomicInteger readCount = new AtomicInteger();
-
-    /**
-     * A queue of elements currently in the map, ordered by access time. Elements are added to the
-     * tail of the queue on access/write.
-     */
-    @GuardedBy("this")
-    final Queue<ReferenceEntry<K, V>> evictionQueue;
-
-    /**
-     * A queue of elements currently in the map, ordered by expiration time (either access or write
-     * time). Elements are added to the tail of the queue on access/write.
-     */
-    @GuardedBy("this")
-    final Queue<ReferenceEntry<K, V>> expirationQueue;
 
     Segment(MapMakerInternalMap<K, V> map, int initialCapacity, int maxSegmentSize) {
       this.map = map;
@@ -2106,21 +817,6 @@ class MapMakerInternalMap<K, V> extends AbstractMap<K, V>
       keyReferenceQueue = map.usesKeyReferences() ? new ReferenceQueue<K>() : null;
 
       valueReferenceQueue = map.usesValueReferences() ? new ReferenceQueue<V>() : null;
-
-      recencyQueue =
-          (map.evictsBySize() || map.expiresAfterAccess())
-              ? new ConcurrentLinkedQueue<ReferenceEntry<K, V>>()
-              : MapMakerInternalMap.<ReferenceEntry<K, V>>discardingQueue();
-
-      evictionQueue =
-          map.evictsBySize()
-              ? new EvictionQueue<K, V>()
-              : MapMakerInternalMap.<ReferenceEntry<K, V>>discardingQueue();
-
-      expirationQueue =
-          map.expires()
-              ? new ExpirationQueue<K, V>()
-              : MapMakerInternalMap.<ReferenceEntry<K, V>>discardingQueue();
     }
 
     AtomicReferenceArray<ReferenceEntry<K, V>> newEntryArray(int size) {
@@ -2165,13 +861,12 @@ class MapMakerInternalMap<K, V> extends AbstractMap<K, V>
     }
 
     /**
-     * Sets a new value of an entry. Adds newly created entries at the end of the expiration queue.
+     * Sets a new value of an entry.
      */
     @GuardedBy("this")
     void setValue(ReferenceEntry<K, V> entry, V value) {
       ValueReference<K, V> valueReference = map.valueStrength.referenceValue(this, entry, value);
       entry.setValueReference(valueReference);
-      recordWrite(entry);
     }
 
     // reference queues, for garbage collection cleanup
@@ -2251,152 +946,6 @@ class MapMakerInternalMap<K, V> extends AbstractMap<K, V>
       while (valueReferenceQueue.poll() != null) {}
     }
 
-    // recency queue, shared by expiration and eviction
-
-    /**
-     * Records the relative order in which this read was performed by adding {@code entry} to the
-     * recency queue. At write-time, or when the queue is full past the threshold, the queue will
-     * be drained and the entries therein processed.
-     *
-     * <p>Note: locked reads should use {@link #recordLockedRead}.
-     */
-    void recordRead(ReferenceEntry<K, V> entry) {
-      if (map.expiresAfterAccess()) {
-        recordExpirationTime(entry, map.expireAfterAccessNanos);
-      }
-      recencyQueue.add(entry);
-    }
-
-    /**
-     * Updates the eviction metadata that {@code entry} was just read. This currently amounts to
-     * adding {@code entry} to relevant eviction lists.
-     *
-     * <p>Note: this method should only be called under lock, as it directly manipulates the
-     * eviction queues. Unlocked reads should use {@link #recordRead}.
-     */
-    @GuardedBy("this")
-    void recordLockedRead(ReferenceEntry<K, V> entry) {
-      evictionQueue.add(entry);
-      if (map.expiresAfterAccess()) {
-        recordExpirationTime(entry, map.expireAfterAccessNanos);
-        expirationQueue.add(entry);
-      }
-    }
-
-    /**
-     * Updates eviction metadata that {@code entry} was just written. This currently amounts to
-     * adding {@code entry} to relevant eviction lists.
-     */
-    @GuardedBy("this")
-    void recordWrite(ReferenceEntry<K, V> entry) {
-      // we are already under lock, so drain the recency queue immediately
-      drainRecencyQueue();
-      evictionQueue.add(entry);
-      if (map.expires()) {
-        // currently MapMaker ensures that expireAfterWrite and
-        // expireAfterAccess are mutually exclusive
-        long expiration =
-            map.expiresAfterAccess() ? map.expireAfterAccessNanos : map.expireAfterWriteNanos;
-        recordExpirationTime(entry, expiration);
-        expirationQueue.add(entry);
-      }
-    }
-
-    /**
-     * Drains the recency queue, updating eviction metadata that the entries therein were read in
-     * the specified relative order. This currently amounts to adding them to relevant eviction
-     * lists (accounting for the fact that they could have been removed from the map since being
-     * added to the recency queue).
-     */
-    @GuardedBy("this")
-    void drainRecencyQueue() {
-      ReferenceEntry<K, V> e;
-      while ((e = recencyQueue.poll()) != null) {
-        // An entry may be in the recency queue despite it being removed from
-        // the map . This can occur when the entry was concurrently read while a
-        // writer is removing it from the segment or after a clear has removed
-        // all of the segment's entries.
-        if (evictionQueue.contains(e)) {
-          evictionQueue.add(e);
-        }
-        if (map.expiresAfterAccess() && expirationQueue.contains(e)) {
-          expirationQueue.add(e);
-        }
-      }
-    }
-
-    // expiration
-
-    void recordExpirationTime(ReferenceEntry<K, V> entry, long expirationNanos) {
-      // might overflow, but that's okay (see isExpired())
-      entry.setExpirationTime(map.ticker.read() + expirationNanos);
-    }
-
-    /**
-     * Cleanup expired entries when the lock is available.
-     */
-    void tryExpireEntries() {
-      if (tryLock()) {
-        try {
-          expireEntries();
-        } finally {
-          unlock();
-          // don't call postWriteCleanup as we're in a read
-        }
-      }
-    }
-
-    @GuardedBy("this")
-    void expireEntries() {
-      drainRecencyQueue();
-
-      if (expirationQueue.isEmpty()) {
-        // There's no point in calling nanoTime() if we have no entries to
-        // expire.
-        return;
-      }
-      long now = map.ticker.read();
-      ReferenceEntry<K, V> e;
-      while ((e = expirationQueue.peek()) != null && map.isExpired(e, now)) {
-        if (!removeEntry(e, e.getHash(), RemovalCause.EXPIRED)) {
-          throw new AssertionError();
-        }
-      }
-    }
-
-    // eviction
-
-    void enqueueNotification(ReferenceEntry<K, V> entry, RemovalCause cause) {
-      enqueueNotification(entry.getKey(), entry.getHash(), entry.getValueReference().get(), cause);
-    }
-
-    void enqueueNotification(@Nullable K key, int hash, @Nullable V value, RemovalCause cause) {
-      if (map.removalNotificationQueue != DISCARDING_QUEUE) {
-        RemovalNotification<K, V> notification = new RemovalNotification<K, V>(key, value, cause);
-        map.removalNotificationQueue.offer(notification);
-      }
-    }
-
-    /**
-     * Performs eviction if the segment is full. This should only be called prior to adding a new
-     * entry and increasing {@code count}.
-     *
-     * @return {@code true} if eviction occurred
-     */
-    @GuardedBy("this")
-    boolean evictEntries() {
-      if (map.evictsBySize() && count >= maxSegmentSize) {
-        drainRecencyQueue();
-
-        ReferenceEntry<K, V> e = evictionQueue.remove();
-        if (!removeEntry(e, e.getHash(), RemovalCause.SIZE)) {
-          throw new AssertionError();
-        }
-        return true;
-      }
-      return false;
-    }
-
     /**
      * Returns first entry of bin for given hash.
      */
@@ -2434,9 +983,6 @@ class MapMakerInternalMap<K, V> extends AbstractMap<K, V>
       ReferenceEntry<K, V> e = getEntry(key, hash);
       if (e == null) {
         return null;
-      } else if (map.expires() && map.isExpired(e)) {
-        tryExpireEntries();
-        return null;
       }
       return e;
     }
@@ -2449,9 +995,7 @@ class MapMakerInternalMap<K, V> extends AbstractMap<K, V>
         }
 
         V value = e.getValueReference().get();
-        if (value != null) {
-          recordRead(e);
-        } else {
+        if (value == null) {
           tryDrainReferenceQueues();
         }
         return value;
@@ -2535,10 +1079,7 @@ class MapMakerInternalMap<K, V> extends AbstractMap<K, V>
               ++modCount;
               setValue(e, value);
               if (!valueReference.isComputingReference()) {
-                enqueueNotification(key, hash, entryValue, RemovalCause.COLLECTED);
                 newCount = this.count; // count remains unchanged
-              } else if (evictEntries()) { // evictEntries after setting new value
-                newCount = this.count + 1;
               }
               this.count = newCount; // write-volatile
               return null;
@@ -2546,12 +1087,10 @@ class MapMakerInternalMap<K, V> extends AbstractMap<K, V>
               // Mimic
               // "if (!map.containsKey(key)) ...
               // else return map.get(key);
-              recordLockedRead(e);
               return entryValue;
             } else {
               // clobber existing entry, count remains unchanged
               ++modCount;
-              enqueueNotification(key, hash, entryValue, RemovalCause.REPLACED);
               setValue(e, value);
               return entryValue;
             }
@@ -2563,14 +1102,10 @@ class MapMakerInternalMap<K, V> extends AbstractMap<K, V>
         ReferenceEntry<K, V> newEntry = newEntry(key, hash, first);
         setValue(newEntry, value);
         table.set(index, newEntry);
-        if (evictEntries()) { // evictEntries after setting new value
-          newCount = this.count + 1;
-        }
         this.count = newCount; // write-volatile
         return null;
       } finally {
         unlock();
-        postWriteCleanup();
       }
     }
 
@@ -2635,7 +1170,6 @@ class MapMakerInternalMap<K, V> extends AbstractMap<K, V>
               if (newFirst != null) {
                 newTable.set(newIndex, newFirst);
               } else {
-                removeCollectedEntry(e);
                 newCount--;
               }
             }
@@ -2668,7 +1202,6 @@ class MapMakerInternalMap<K, V> extends AbstractMap<K, V>
               if (isCollected(valueReference)) {
                 int newCount = this.count - 1;
                 ++modCount;
-                enqueueNotification(entryKey, hash, entryValue, RemovalCause.COLLECTED);
                 ReferenceEntry<K, V> newFirst = removeFromChain(first, e);
                 newCount = this.count - 1;
                 table.set(index, newFirst);
@@ -2679,13 +1212,11 @@ class MapMakerInternalMap<K, V> extends AbstractMap<K, V>
 
             if (map.valueEquivalence.equivalent(oldValue, entryValue)) {
               ++modCount;
-              enqueueNotification(key, hash, entryValue, RemovalCause.REPLACED);
               setValue(e, newValue);
               return true;
             } else {
               // Mimic
               // "if (map.containsKey(key) && map.get(key).equals(oldValue))..."
-              recordLockedRead(e);
               return false;
             }
           }
@@ -2694,7 +1225,6 @@ class MapMakerInternalMap<K, V> extends AbstractMap<K, V>
         return false;
       } finally {
         unlock();
-        postWriteCleanup();
       }
     }
 
@@ -2720,7 +1250,6 @@ class MapMakerInternalMap<K, V> extends AbstractMap<K, V>
               if (isCollected(valueReference)) {
                 int newCount = this.count - 1;
                 ++modCount;
-                enqueueNotification(entryKey, hash, entryValue, RemovalCause.COLLECTED);
                 ReferenceEntry<K, V> newFirst = removeFromChain(first, e);
                 newCount = this.count - 1;
                 table.set(index, newFirst);
@@ -2730,7 +1259,6 @@ class MapMakerInternalMap<K, V> extends AbstractMap<K, V>
             }
 
             ++modCount;
-            enqueueNotification(key, hash, entryValue, RemovalCause.REPLACED);
             setValue(e, newValue);
             return entryValue;
           }
@@ -2739,7 +1267,6 @@ class MapMakerInternalMap<K, V> extends AbstractMap<K, V>
         return null;
       } finally {
         unlock();
-        postWriteCleanup();
       }
     }
 
@@ -2762,17 +1289,15 @@ class MapMakerInternalMap<K, V> extends AbstractMap<K, V>
             ValueReference<K, V> valueReference = e.getValueReference();
             V entryValue = valueReference.get();
 
-            RemovalCause cause;
             if (entryValue != null) {
-              cause = RemovalCause.EXPLICIT;
+              // TODO(kak): Remove this branch
             } else if (isCollected(valueReference)) {
-              cause = RemovalCause.COLLECTED;
+              // TODO(kak): Remove this branch
             } else {
               return null;
             }
 
             ++modCount;
-            enqueueNotification(entryKey, hash, entryValue, cause);
             ReferenceEntry<K, V> newFirst = removeFromChain(first, e);
             newCount = this.count - 1;
             table.set(index, newFirst);
@@ -2784,7 +1309,6 @@ class MapMakerInternalMap<K, V> extends AbstractMap<K, V>
         return null;
       } finally {
         unlock();
-        postWriteCleanup();
       }
     }
 
@@ -2806,29 +1330,27 @@ class MapMakerInternalMap<K, V> extends AbstractMap<K, V>
             ValueReference<K, V> valueReference = e.getValueReference();
             V entryValue = valueReference.get();
 
-            RemovalCause cause;
+            boolean explicitRemoval = false;
             if (map.valueEquivalence.equivalent(value, entryValue)) {
-              cause = RemovalCause.EXPLICIT;
+              explicitRemoval = true;
             } else if (isCollected(valueReference)) {
-              cause = RemovalCause.COLLECTED;
+              // TODO(kak): Remove this branch
             } else {
               return false;
             }
 
             ++modCount;
-            enqueueNotification(entryKey, hash, entryValue, cause);
             ReferenceEntry<K, V> newFirst = removeFromChain(first, e);
             newCount = this.count - 1;
             table.set(index, newFirst);
             this.count = newCount; // write-volatile
-            return (cause == RemovalCause.EXPLICIT);
+            return explicitRemoval;
           }
         }
 
         return false;
       } finally {
         unlock();
-        postWriteCleanup();
       }
     }
 
@@ -2837,29 +1359,16 @@ class MapMakerInternalMap<K, V> extends AbstractMap<K, V>
         lock();
         try {
           AtomicReferenceArray<ReferenceEntry<K, V>> table = this.table;
-          if (map.removalNotificationQueue != DISCARDING_QUEUE) {
-            for (int i = 0; i < table.length(); ++i) {
-              for (ReferenceEntry<K, V> e = table.get(i); e != null; e = e.getNext()) {
-                // Computing references aren't actually in the map yet.
-                if (!e.getValueReference().isComputingReference()) {
-                  enqueueNotification(e, RemovalCause.EXPLICIT);
-                }
-              }
-            }
-          }
           for (int i = 0; i < table.length(); ++i) {
             table.set(i, null);
           }
           clearReferenceQueues();
-          evictionQueue.clear();
-          expirationQueue.clear();
           readCount.set(0);
 
           ++modCount;
           count = 0; // write-volatile
         } finally {
           unlock();
-          postWriteCleanup();
         }
       }
     }
@@ -2878,9 +1387,6 @@ class MapMakerInternalMap<K, V> extends AbstractMap<K, V>
      */
     @GuardedBy("this")
     ReferenceEntry<K, V> removeFromChain(ReferenceEntry<K, V> first, ReferenceEntry<K, V> entry) {
-      evictionQueue.remove(entry);
-      expirationQueue.remove(entry);
-
       int newCount = count;
       ReferenceEntry<K, V> newFirst = entry.getNext();
       for (ReferenceEntry<K, V> e = first; e != entry; e = e.getNext()) {
@@ -2888,18 +1394,11 @@ class MapMakerInternalMap<K, V> extends AbstractMap<K, V>
         if (next != null) {
           newFirst = next;
         } else {
-          removeCollectedEntry(e);
           newCount--;
         }
       }
       this.count = newCount;
       return newFirst;
-    }
-
-    void removeCollectedEntry(ReferenceEntry<K, V> entry) {
-      enqueueNotification(entry, RemovalCause.COLLECTED);
-      evictionQueue.remove(entry);
-      expirationQueue.remove(entry);
     }
 
     /**
@@ -2917,8 +1416,6 @@ class MapMakerInternalMap<K, V> extends AbstractMap<K, V>
         for (ReferenceEntry<K, V> e = first; e != null; e = e.getNext()) {
           if (e == entry) {
             ++modCount;
-            enqueueNotification(
-                e.getKey(), hash, e.getValueReference().get(), RemovalCause.COLLECTED);
             ReferenceEntry<K, V> newFirst = removeFromChain(first, e);
             newCount = this.count - 1;
             table.set(index, newFirst);
@@ -2930,7 +1427,6 @@ class MapMakerInternalMap<K, V> extends AbstractMap<K, V>
         return false;
       } finally {
         unlock();
-        postWriteCleanup();
       }
     }
 
@@ -2954,7 +1450,6 @@ class MapMakerInternalMap<K, V> extends AbstractMap<K, V>
             ValueReference<K, V> v = e.getValueReference();
             if (v == valueReference) {
               ++modCount;
-              enqueueNotification(key, hash, valueReference.get(), RemovalCause.COLLECTED);
               ReferenceEntry<K, V> newFirst = removeFromChain(first, e);
               newCount = this.count - 1;
               table.set(index, newFirst);
@@ -2968,9 +1463,6 @@ class MapMakerInternalMap<K, V> extends AbstractMap<K, V>
         return false;
       } finally {
         unlock();
-        if (!isHeldByCurrentThread()) { // don't cleanup inside of put
-          postWriteCleanup();
-        }
       }
     }
 
@@ -3003,13 +1495,12 @@ class MapMakerInternalMap<K, V> extends AbstractMap<K, V>
         return false;
       } finally {
         unlock();
-        postWriteCleanup();
       }
     }
 
     @CanIgnoreReturnValue
     @GuardedBy("this")
-    boolean removeEntry(ReferenceEntry<K, V> entry, int hash, RemovalCause cause) {
+    boolean removeEntry(ReferenceEntry<K, V> entry, int hash) {
       int newCount = this.count - 1;
       AtomicReferenceArray<ReferenceEntry<K, V>> table = this.table;
       int index = hash & (table.length() - 1);
@@ -3018,7 +1509,6 @@ class MapMakerInternalMap<K, V> extends AbstractMap<K, V>
       for (ReferenceEntry<K, V> e = first; e != null; e = e.getNext()) {
         if (e == entry) {
           ++modCount;
-          enqueueNotification(e.getKey(), hash, e.getValueReference().get(), cause);
           ReferenceEntry<K, V> newFirst = removeFromChain(first, e);
           newCount = this.count - 1;
           table.set(index, newFirst);
@@ -3043,7 +1533,7 @@ class MapMakerInternalMap<K, V> extends AbstractMap<K, V>
 
     /**
      * Gets the value from an entry. Returns {@code null} if the entry is invalid,
-     * partially-collected, computing, or expired.
+     * partially-collected or computing.
      */
     V getLiveValue(ReferenceEntry<K, V> entry) {
       if (entry.getKey() == null) {
@@ -3056,10 +1546,6 @@ class MapMakerInternalMap<K, V> extends AbstractMap<K, V>
         return null;
       }
 
-      if (map.expires() && map.isExpired(entry)) {
-        tryExpireEntries();
-        return null;
-      }
       return value;
     }
 
@@ -3077,313 +1563,25 @@ class MapMakerInternalMap<K, V> extends AbstractMap<K, V>
     /**
      * Performs routine cleanup prior to executing a write. This should be called every time a
      * write thread acquires the segment lock, immediately after acquiring the lock.
-     *
-     * <p>Post-condition: expireEntries has been run.
      */
     @GuardedBy("this")
     void preWriteCleanup() {
       runLockedCleanup();
     }
 
-    /**
-     * Performs routine cleanup following a write.
-     */
-    void postWriteCleanup() {
-      runUnlockedCleanup();
-    }
-
     void runCleanup() {
       runLockedCleanup();
-      runUnlockedCleanup();
     }
 
     void runLockedCleanup() {
       if (tryLock()) {
         try {
           drainReferenceQueues();
-          expireEntries(); // calls drainRecencyQueue
           readCount.set(0);
         } finally {
           unlock();
         }
       }
-    }
-
-    void runUnlockedCleanup() {
-      // locked cleanup may generate notifications we can send unlocked
-      if (!isHeldByCurrentThread()) {
-        map.processPendingNotifications();
-      }
-    }
-  }
-
-  // Queues
-
-  /**
-   * A custom queue for managing eviction order. Note that this is tightly integrated with {@code
-   * ReferenceEntry}, upon which it relies to perform its linking.
-   *
-   * <p>Note that this entire implementation makes the assumption that all elements which are in
-   * the map are also in this queue, and that all elements not in the queue are not in the map.
-   *
-   * <p>The benefits of creating our own queue are that (1) we can replace elements in the middle
-   * of the queue as part of copyEvictableEntry, and (2) the contains method is highly optimized
-   * for the current model.
-   */
-  static final class EvictionQueue<K, V> extends AbstractQueue<ReferenceEntry<K, V>> {
-    final ReferenceEntry<K, V> head =
-        new AbstractReferenceEntry<K, V>() {
-
-          ReferenceEntry<K, V> nextEvictable = this;
-
-          @Override
-          public ReferenceEntry<K, V> getNextEvictable() {
-            return nextEvictable;
-          }
-
-          @Override
-          public void setNextEvictable(ReferenceEntry<K, V> next) {
-            this.nextEvictable = next;
-          }
-
-          ReferenceEntry<K, V> previousEvictable = this;
-
-          @Override
-          public ReferenceEntry<K, V> getPreviousEvictable() {
-            return previousEvictable;
-          }
-
-          @Override
-          public void setPreviousEvictable(ReferenceEntry<K, V> previous) {
-            this.previousEvictable = previous;
-          }
-        };
-
-    // implements Queue
-
-    @Override
-    public boolean offer(ReferenceEntry<K, V> entry) {
-      // unlink
-      connectEvictables(entry.getPreviousEvictable(), entry.getNextEvictable());
-
-      // add to tail
-      connectEvictables(head.getPreviousEvictable(), entry);
-      connectEvictables(entry, head);
-
-      return true;
-    }
-
-    @Override
-    public ReferenceEntry<K, V> peek() {
-      ReferenceEntry<K, V> next = head.getNextEvictable();
-      return (next == head) ? null : next;
-    }
-
-    @Override
-    public ReferenceEntry<K, V> poll() {
-      ReferenceEntry<K, V> next = head.getNextEvictable();
-      if (next == head) {
-        return null;
-      }
-
-      remove(next);
-      return next;
-    }
-
-    @CanIgnoreReturnValue
-    @Override
-    @SuppressWarnings("unchecked")
-    public boolean remove(Object o) {
-      ReferenceEntry<K, V> e = (ReferenceEntry) o;
-      ReferenceEntry<K, V> previous = e.getPreviousEvictable();
-      ReferenceEntry<K, V> next = e.getNextEvictable();
-      connectEvictables(previous, next);
-      nullifyEvictable(e);
-
-      return next != NullEntry.INSTANCE;
-    }
-
-    @Override
-    @SuppressWarnings("unchecked")
-    public boolean contains(Object o) {
-      ReferenceEntry<K, V> e = (ReferenceEntry) o;
-      return e.getNextEvictable() != NullEntry.INSTANCE;
-    }
-
-    @Override
-    public boolean isEmpty() {
-      return head.getNextEvictable() == head;
-    }
-
-    @Override
-    public int size() {
-      int size = 0;
-      for (ReferenceEntry<K, V> e = head.getNextEvictable(); e != head; e = e.getNextEvictable()) {
-        size++;
-      }
-      return size;
-    }
-
-    @Override
-    public void clear() {
-      ReferenceEntry<K, V> e = head.getNextEvictable();
-      while (e != head) {
-        ReferenceEntry<K, V> next = e.getNextEvictable();
-        nullifyEvictable(e);
-        e = next;
-      }
-
-      head.setNextEvictable(head);
-      head.setPreviousEvictable(head);
-    }
-
-    @Override
-    public Iterator<ReferenceEntry<K, V>> iterator() {
-      return new AbstractSequentialIterator<ReferenceEntry<K, V>>(peek()) {
-        @Override
-        protected ReferenceEntry<K, V> computeNext(ReferenceEntry<K, V> previous) {
-          ReferenceEntry<K, V> next = previous.getNextEvictable();
-          return (next == head) ? null : next;
-        }
-      };
-    }
-  }
-
-  /**
-   * A custom queue for managing expiration order. Note that this is tightly integrated with
-   * {@code ReferenceEntry}, upon which it reliese to perform its linking.
-   *
-   * <p>Note that this entire implementation makes the assumption that all elements which are in
-   * the map are also in this queue, and that all elements not in the queue are not in the map.
-   *
-   * <p>The benefits of creating our own queue are that (1) we can replace elements in the middle
-   * of the queue as part of copyEvictableEntry, and (2) the contains method is highly optimized
-   * for the current model.
-   */
-  static final class ExpirationQueue<K, V> extends AbstractQueue<ReferenceEntry<K, V>> {
-    final ReferenceEntry<K, V> head =
-        new AbstractReferenceEntry<K, V>() {
-
-          @Override
-          public long getExpirationTime() {
-            return Long.MAX_VALUE;
-          }
-
-          @Override
-          public void setExpirationTime(long time) {}
-
-          ReferenceEntry<K, V> nextExpirable = this;
-
-          @Override
-          public ReferenceEntry<K, V> getNextExpirable() {
-            return nextExpirable;
-          }
-
-          @Override
-          public void setNextExpirable(ReferenceEntry<K, V> next) {
-            this.nextExpirable = next;
-          }
-
-          ReferenceEntry<K, V> previousExpirable = this;
-
-          @Override
-          public ReferenceEntry<K, V> getPreviousExpirable() {
-            return previousExpirable;
-          }
-
-          @Override
-          public void setPreviousExpirable(ReferenceEntry<K, V> previous) {
-            this.previousExpirable = previous;
-          }
-        };
-
-    // implements Queue
-
-    @Override
-    public boolean offer(ReferenceEntry<K, V> entry) {
-      // unlink
-      connectExpirables(entry.getPreviousExpirable(), entry.getNextExpirable());
-
-      // add to tail
-      connectExpirables(head.getPreviousExpirable(), entry);
-      connectExpirables(entry, head);
-
-      return true;
-    }
-
-    @Override
-    public ReferenceEntry<K, V> peek() {
-      ReferenceEntry<K, V> next = head.getNextExpirable();
-      return (next == head) ? null : next;
-    }
-
-    @Override
-    public ReferenceEntry<K, V> poll() {
-      ReferenceEntry<K, V> next = head.getNextExpirable();
-      if (next == head) {
-        return null;
-      }
-
-      remove(next);
-      return next;
-    }
-
-    @CanIgnoreReturnValue
-    @Override
-    @SuppressWarnings("unchecked")
-    public boolean remove(Object o) {
-      ReferenceEntry<K, V> e = (ReferenceEntry) o;
-      ReferenceEntry<K, V> previous = e.getPreviousExpirable();
-      ReferenceEntry<K, V> next = e.getNextExpirable();
-      connectExpirables(previous, next);
-      nullifyExpirable(e);
-
-      return next != NullEntry.INSTANCE;
-    }
-
-    @Override
-    @SuppressWarnings("unchecked")
-    public boolean contains(Object o) {
-      ReferenceEntry<K, V> e = (ReferenceEntry) o;
-      return e.getNextExpirable() != NullEntry.INSTANCE;
-    }
-
-    @Override
-    public boolean isEmpty() {
-      return head.getNextExpirable() == head;
-    }
-
-    @Override
-    public int size() {
-      int size = 0;
-      for (ReferenceEntry<K, V> e = head.getNextExpirable(); e != head; e = e.getNextExpirable()) {
-        size++;
-      }
-      return size;
-    }
-
-    @Override
-    public void clear() {
-      ReferenceEntry<K, V> e = head.getNextExpirable();
-      while (e != head) {
-        ReferenceEntry<K, V> next = e.getNextExpirable();
-        nullifyExpirable(e);
-        e = next;
-      }
-
-      head.setNextExpirable(head);
-      head.setPreviousExpirable(head);
-    }
-
-    @Override
-    public Iterator<ReferenceEntry<K, V>> iterator() {
-      return new AbstractSequentialIterator<ReferenceEntry<K, V>>(peek()) {
-        @Override
-        protected ReferenceEntry<K, V> computeNext(ReferenceEntry<K, V> previous) {
-          ReferenceEntry<K, V> next = previous.getNextExpirable();
-          return (next == head) ? null : next;
-        }
-      };
     }
   }
 
@@ -3461,7 +1659,7 @@ class MapMakerInternalMap<K, V> extends AbstractMap<K, V>
   }
 
   /**
-   * Returns the internal entry for the specified key. The entry may be computing, expired, or
+   * Returns the internal entry for the specified key. The entry may be computing or
    * partially collected. Does not impact recency ordering.
    */
   ReferenceEntry<K, V> getEntry(@Nullable Object key) {
@@ -3958,11 +2156,7 @@ class MapMakerInternalMap<K, V> extends AbstractMap<K, V>
         valueStrength,
         keyEquivalence,
         valueEquivalence,
-        expireAfterWriteNanos,
-        expireAfterAccessNanos,
-        maximumSize,
         concurrencyLevel,
-        removalListener,
         this);
   }
 
@@ -3978,11 +2172,7 @@ class MapMakerInternalMap<K, V> extends AbstractMap<K, V>
     final Strength valueStrength;
     final Equivalence<Object> keyEquivalence;
     final Equivalence<Object> valueEquivalence;
-    final long expireAfterWriteNanos;
-    final long expireAfterAccessNanos;
-    final int maximumSize;
     final int concurrencyLevel;
-    final RemovalListener<? super K, ? super V> removalListener;
 
     transient ConcurrentMap<K, V> delegate;
 
@@ -3991,21 +2181,13 @@ class MapMakerInternalMap<K, V> extends AbstractMap<K, V>
         Strength valueStrength,
         Equivalence<Object> keyEquivalence,
         Equivalence<Object> valueEquivalence,
-        long expireAfterWriteNanos,
-        long expireAfterAccessNanos,
-        int maximumSize,
         int concurrencyLevel,
-        RemovalListener<? super K, ? super V> removalListener,
         ConcurrentMap<K, V> delegate) {
       this.keyStrength = keyStrength;
       this.valueStrength = valueStrength;
       this.keyEquivalence = keyEquivalence;
       this.valueEquivalence = valueEquivalence;
-      this.expireAfterWriteNanos = expireAfterWriteNanos;
-      this.expireAfterAccessNanos = expireAfterAccessNanos;
-      this.maximumSize = maximumSize;
       this.concurrencyLevel = concurrencyLevel;
-      this.removalListener = removalListener;
       this.delegate = delegate;
     }
 
@@ -4026,24 +2208,12 @@ class MapMakerInternalMap<K, V> extends AbstractMap<K, V>
     @SuppressWarnings("deprecation") // serialization of deprecated feature
     MapMaker readMapMaker(ObjectInputStream in) throws IOException {
       int size = in.readInt();
-      MapMaker mapMaker =
-          new MapMaker()
-              .initialCapacity(size)
-              .setKeyStrength(keyStrength)
-              .setValueStrength(valueStrength)
-              .keyEquivalence(keyEquivalence)
-              .concurrencyLevel(concurrencyLevel);
-      mapMaker.removalListener(removalListener);
-      if (expireAfterWriteNanos > 0) {
-        mapMaker.expireAfterWrite(expireAfterWriteNanos, TimeUnit.NANOSECONDS);
-      }
-      if (expireAfterAccessNanos > 0) {
-        mapMaker.expireAfterAccess(expireAfterAccessNanos, TimeUnit.NANOSECONDS);
-      }
-      if (maximumSize != MapMaker.UNSET_INT) {
-        mapMaker.maximumSize(maximumSize);
-      }
-      return mapMaker;
+      return new MapMaker()
+          .initialCapacity(size)
+          .setKeyStrength(keyStrength)
+          .setValueStrength(valueStrength)
+          .keyEquivalence(keyEquivalence)
+          .concurrencyLevel(concurrencyLevel);
     }
 
     @SuppressWarnings("unchecked")
@@ -4071,22 +2241,14 @@ class MapMakerInternalMap<K, V> extends AbstractMap<K, V>
         Strength valueStrength,
         Equivalence<Object> keyEquivalence,
         Equivalence<Object> valueEquivalence,
-        long expireAfterWriteNanos,
-        long expireAfterAccessNanos,
-        int maximumSize,
         int concurrencyLevel,
-        RemovalListener<? super K, ? super V> removalListener,
         ConcurrentMap<K, V> delegate) {
       super(
           keyStrength,
           valueStrength,
           keyEquivalence,
           valueEquivalence,
-          expireAfterWriteNanos,
-          expireAfterAccessNanos,
-          maximumSize,
           concurrencyLevel,
-          removalListener,
           delegate);
     }
 

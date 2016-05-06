@@ -16,33 +16,19 @@
 
 package com.google.common.collect;
 
-import static com.google.common.collect.MapMakerInternalMap.DRAIN_THRESHOLD;
-import static com.google.common.collect.MapMakerInternalMapTest.SMALL_MAX_SIZE;
-import static com.google.common.collect.MapMakerInternalMapTest.allEvictingMakers;
-import static com.google.common.collect.MapMakerInternalMapTest.assertNotified;
-import static com.google.common.collect.MapMakerInternalMapTest.checkAndDrainRecencyQueue;
-import static com.google.common.collect.MapMakerInternalMapTest.checkEvictionQueues;
-import static com.google.common.collect.MapMakerInternalMapTest.checkExpirationTimes;
-
 import com.google.common.base.Function;
 import com.google.common.base.Functions;
 import com.google.common.collect.MapMaker.ComputingMapAdapter;
-import com.google.common.collect.MapMaker.RemovalCause;
 import com.google.common.collect.MapMakerInternalMap.ReferenceEntry;
 import com.google.common.collect.MapMakerInternalMap.Segment;
 import com.google.common.collect.MapMakerInternalMapTest.DummyEntry;
 import com.google.common.collect.MapMakerInternalMapTest.DummyValueReference;
-import com.google.common.collect.MapMakerInternalMapTest.QueuingRemovalListener;
 import com.google.common.testing.NullPointerTester;
 
 import junit.framework.TestCase;
 
-import java.util.Iterator;
-import java.util.List;
-import java.util.Random;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReferenceArray;
 
@@ -100,50 +86,6 @@ public class ComputingConcurrentHashMapTest extends TestCase {
       map.get(new Object());
       fail();
     } catch (NullPointerException expected) {}
-  }
-
-  public void testRecordReadOnCompute() throws ExecutionException {
-    CountingFunction computingFunction = new CountingFunction();
-    for (MapMaker maker : allEvictingMakers()) {
-      ComputingConcurrentHashMap<Object, Object> map =
-          makeComputingMap(maker.concurrencyLevel(1), computingFunction);
-      Segment<Object, Object> segment = map.segments[0];
-      List<ReferenceEntry<Object, Object>> writeOrder = Lists.newLinkedList();
-      List<ReferenceEntry<Object, Object>> readOrder = Lists.newLinkedList();
-      for (int i = 0; i < SMALL_MAX_SIZE; i++) {
-        Object key = new Object();
-        int hash = map.hash(key);
-
-        map.getOrCompute(key);
-        ReferenceEntry<Object, Object> entry = segment.getEntry(key, hash);
-        writeOrder.add(entry);
-        readOrder.add(entry);
-      }
-
-      checkEvictionQueues(map, segment, readOrder, writeOrder);
-      checkExpirationTimes(map);
-      assertTrue(segment.recencyQueue.isEmpty());
-
-      // access some of the elements
-      Random random = new Random();
-      List<ReferenceEntry<Object, Object>> reads = Lists.newArrayList();
-      Iterator<ReferenceEntry<Object, Object>> i = readOrder.iterator();
-      while (i.hasNext()) {
-        ReferenceEntry<Object, Object> entry = i.next();
-        if (random.nextBoolean()) {
-          map.getOrCompute(entry.getKey());
-          reads.add(entry);
-          i.remove();
-          assertTrue(segment.recencyQueue.size() <= DRAIN_THRESHOLD);
-        }
-      }
-      int undrainedIndex = reads.size() - segment.recencyQueue.size();
-      checkAndDrainRecencyQueue(map, segment, reads.subList(undrainedIndex, reads.size()));
-      readOrder.addAll(reads);
-
-      checkEvictionQueues(map, segment, readOrder, writeOrder);
-      checkExpirationTimes(map);
-    }
   }
 
   public void testComputeExistingEntry() throws ExecutionException {
@@ -218,23 +160,6 @@ public class ComputingConcurrentHashMapTest extends TestCase {
     assertEquals(1, segment.count);
   }
 
-  @AndroidIncompatible // Perhaps emulator clock does not update between the two get() calls?
-  @SuppressWarnings("deprecation") // test of deprecated method
-  public void testComputeExpiredEntry() throws ExecutionException {
-    MapMaker maker = createMapMaker().expireAfterWrite(1, TimeUnit.NANOSECONDS);
-    CountingFunction computingFunction = new CountingFunction();
-    ComputingConcurrentHashMap<Object, Object> map = makeComputingMap(maker, computingFunction);
-    assertEquals(0, computingFunction.getCount());
-
-    Object key = new Object();
-    Object one = map.getOrCompute(key);
-    assertEquals(1, computingFunction.getCount());
-
-    Object two = map.getOrCompute(key);
-    assertNotSame(one, two);
-    assertEquals(2, computingFunction.getCount());
-  }
-
   public void testRemovalListener_replaced() {
     // TODO(user): May be a good candidate to play with the MultithreadedTestCase
     final CountDownLatch startSignal = new CountDownLatch(1);
@@ -255,12 +180,9 @@ public class ComputingConcurrentHashMapTest extends TestCase {
       }
     };
 
-    QueuingRemovalListener<Object, Object> listener =
-        new QueuingRemovalListener<Object, Object>();
-    MapMaker maker = (MapMaker) createMapMaker().removalListener(listener);
+    MapMaker maker = (MapMaker) createMapMaker();
     final ComputingConcurrentHashMap<Object, Object> map =
         makeComputingMap(maker, computingFunction);
-    assertTrue(listener.isEmpty());
 
     final Object one = new Object();
     final Object two = new Object();
@@ -294,8 +216,6 @@ public class ComputingConcurrentHashMapTest extends TestCase {
     }
 
     assertNotNull(map.putIfAbsent(one, three)); // force notifications
-    assertNotified(listener, one, computedObject, RemovalCause.REPLACED);
-    assertTrue(listener.isEmpty());
   }
 
   // computing functions
